@@ -34,12 +34,44 @@ try:
 except ImportError:
     RDMA_AVAILABLE = False
 
-# For parallel TCP (fallback)
-import zmq  # ZeroMQ for high-performance messaging
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+def _import_zmq():
+    """Load pyzmq only when parallel TCP is used (optional dependency)."""
+    try:
+        import zmq
+        return zmq
+    except ImportError as e:
+        raise ImportError(
+            "parallel TCP mode requires pyzmq. Install with: pip install pyzmq"
+        ) from e
 
 DEFAULT_CHUNK_SIZE = 32 * 1024 * 1024  # 32 MB chunks
 DEFAULT_NUM_STREAMS = 16  # Parallel streams for TCP fallback
+
+_ENV_PREFIX = "MODEL_TRANSFER_"
+
+
+def _load_dotenv() -> None:
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+    script_dir = Path(__file__).resolve().parent
+    load_dotenv(script_dir / ".env")
+
+
+def _mt_env(key: str) -> Optional[str]:
+    v = os.environ.get(f"{_ENV_PREFIX}{key}")
+    return v if v else None
+
+
+def _mt_env_int(key: str, default: int) -> int:
+    v = _mt_env(key)
+    if v is None:
+        return default
+    return int(v)
 
 
 @dataclass
@@ -135,10 +167,12 @@ class ParallelTCPTransfer:
         self.peer_ip = peer_ip
         self.port = port
         self.num_streams = num_streams
-        self.context = zmq.Context()
-        
+        self._zmq = _import_zmq()
+        self.context = self._zmq.Context()
+
     def _send_chunk(self, chunk_id: int, data: bytes, offset: int, file_path: str):
         """Send a single chunk over a specific stream."""
+        zmq = self._zmq
         socket = self.context.socket(zmq.PUSH)
         socket.connect(f"tcp://{self.peer_ip}:{self.port + chunk_id % self.num_streams}")
         
@@ -182,6 +216,7 @@ class ParallelTCPTransfer:
         receivers = []
         
         def receive_stream(stream_id: int):
+            zmq = self._zmq
             socket = self.context.socket(zmq.PULL)
             socket.bind(f"tcp://*:{self.port + stream_id}")
             
@@ -316,19 +351,13 @@ class ModelTransfer:
         rdma = RDMATransfer(rank, world_size, master_addr, master_port)
         
         try:
-            # Send files (only rank 0 does actual transfer, others receive)
-            if rank == 0:  # Sender (spark1)
-                for file_info in to_transfer:
-                    src_path = self.src_dir / file_info.path
-                    dest_path = self.dest_dir / file_info.path
-                    rdma.send_file(str(src_path), str(dest_path))
-            else:  # Receiver (spark2)
-                # For each file, receive (synchronized by sender)
-                for file_info in to_transfer:
-                    dest_path = self.dest_dir / file_info.path
-                    # Receiver will get data via broadcast
-                    pass  # Data is received in send_file method on rank 0
-            
+            # Both ranks must call send_file: broadcast is collective; rank 0 reads
+            # disk, rank 1 writes to dest_path (src path is ignored on receiver).
+            for file_info in to_transfer:
+                src_path = self.src_dir / file_info.path
+                dest_path = self.dest_dir / file_info.path
+                rdma.send_file(str(src_path), str(dest_path))
+
             return True
         finally:
             rdma.cleanup()
@@ -364,29 +393,92 @@ class ModelTransfer:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='High-speed Hugging Face model transfer')
-    parser.add_argument('--src', required=True, help='Source directory (spark1)')
-    parser.add_argument('--dest', required=True, help='Destination directory (spark2)')
-    parser.add_argument('--mode', choices=['rdma', 'parallel_tcp', 'rsync'], default='rdma',
-                       help='Transfer mode')
-    
+    _load_dotenv()
+
+    parser = argparse.ArgumentParser(
+        description='High-speed Hugging Face model transfer',
+        epilog=(
+            'Optional defaults from .env (see env.example): '
+            f'{_ENV_PREFIX}SRC, {_ENV_PREFIX}DEST, {_ENV_PREFIX}MODE, '
+            f'{_ENV_PREFIX}RANK, {_ENV_PREFIX}WORLD_SIZE, {_ENV_PREFIX}MASTER_ADDR, '
+            f'{_ENV_PREFIX}MASTER_PORT, {_ENV_PREFIX}LOCAL_IP, {_ENV_PREFIX}PEER_IP, '
+            f'{_ENV_PREFIX}ZMQ_PORT, {_ENV_PREFIX}NUM_STREAMS, {_ENV_PREFIX}DEST_HOST, '
+            f'{_ENV_PREFIX}DEST_USER'
+        ),
+    )
+    parser.add_argument('--src', default=_mt_env('SRC'), help='Source directory (spark1)')
+    parser.add_argument('--dest', default=_mt_env('DEST'), help='Destination directory (spark2)')
+    parser.add_argument(
+        '--mode',
+        choices=['rdma', 'parallel_tcp', 'rsync'],
+        default=_mt_env('MODE') or 'rdma',
+        help='Transfer mode',
+    )
+
     # RDMA options
-    parser.add_argument('--rank', type=int, default=0, help='Rank (0 for sender, 1 for receiver)')
-    parser.add_argument('--world-size', type=int, default=2, help='World size (usually 2)')
-    parser.add_argument('--master-addr', default='192.168.100.11', help='Master address')
-    parser.add_argument('--master-port', type=int, default=29500, help='Master port')
-    
+    parser.add_argument(
+        '--rank',
+        type=int,
+        default=_mt_env_int('RANK', 0),
+        help='Rank (0 for sender, 1 for receiver)',
+    )
+    parser.add_argument(
+        '--world-size',
+        type=int,
+        default=_mt_env_int('WORLD_SIZE', 2),
+        help='World size (usually 2)',
+    )
+    parser.add_argument(
+        '--master-addr',
+        default=_mt_env('MASTER_ADDR') or '192.168.100.11',
+        help='Master address',
+    )
+    parser.add_argument(
+        '--master-port',
+        type=int,
+        default=_mt_env_int('MASTER_PORT', 29500),
+        help='Master port',
+    )
+
     # Parallel TCP options
-    parser.add_argument('--local-ip', default='192.168.100.11', help='Local IP for TCP')
-    parser.add_argument('--peer-ip', default='192.168.100.12', help='Peer IP for TCP')
-    parser.add_argument('--port', type=int, default=5555, help='Base port for TCP streams')
-    parser.add_argument('--num-streams', type=int, default=16, help='Number of parallel streams')
-    
+    parser.add_argument(
+        '--local-ip',
+        default=_mt_env('LOCAL_IP') or '192.168.100.11',
+        help='Local IP for TCP',
+    )
+    parser.add_argument(
+        '--peer-ip',
+        default=_mt_env('PEER_IP') or '192.168.100.12',
+        help='Peer IP for TCP',
+    )
+    parser.add_argument(
+        '--port',
+        type=int,
+        default=_mt_env_int('ZMQ_PORT', 5555),
+        help='Base port for TCP streams',
+    )
+    parser.add_argument(
+        '--num-streams',
+        type=int,
+        default=_mt_env_int('NUM_STREAMS', DEFAULT_NUM_STREAMS),
+        help='Number of parallel streams',
+    )
+
     # Rsync options
-    parser.add_argument('--dest-host', help='Destination host for rsync')
-    parser.add_argument('--dest-user', default='chenchen', help='Destination user for rsync')
-    
+    parser.add_argument('--dest-host', default=_mt_env('DEST_HOST'), help='Destination host for rsync')
+    parser.add_argument(
+        '--dest-user',
+        default=_mt_env('DEST_USER') or 'chenchen',
+        help='Destination user for rsync',
+    )
+
     args = parser.parse_args()
+
+    if not args.src or not args.dest:
+        parser.error(
+            f'Source and destination are required (use --src/--dest or '
+            f'{_ENV_PREFIX}SRC / {_ENV_PREFIX}DEST in .env)'
+        )
     
     transfer = ModelTransfer(args.src, args.dest, use_rdma=(args.mode == 'rdma'))
     
