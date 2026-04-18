@@ -54,6 +54,18 @@ Meaning of the variables:
 | `MODEL_TRANSFER_MASTER_PORT` | Same on both |
 | `MODEL_TRANSFER_SRC` | Model folder (same tree visible on both hosts) |
 | `MODEL_TRANSFER_DEST` | Master: local path ≠ `SRC` (skip logic). Worker: output folder on spark2 |
+| `MODEL_TRANSFER_TORCH_BACKEND` | `gloo` (default) or `nccl` — see below |
+| `MODEL_TRANSFER_INIT_TIMEOUT_SEC` | How long to wait for the other node (default `1800`) |
+
+### PyTorch backend: you do **not** need NCCL for the default
+
+The script sends bytes with PyTorch **distributed**. **NCCL is only for GPU tensors.** The old logic picked NCCL whenever CUDA was present but still used **CPU** tensors, which **does not work**.
+
+- **`MODEL_TRANSFER_TORCH_BACKEND=gloo`** (default in `env.*.example`): CPU tensors, **no NCCL**, fine for two machines over regular TCP. Use this unless you know you want NCCL.
+
+- **`MODEL_TRANSFER_TORCH_BACKEND=nccl`**: uses **GPU** tensors; requires **CUDA + working NCCL** on **both** spark1 and spark2, matching PyTorch/CUDA builds. Use the same Docker image (or same stack) on both nodes. If NCCL fails, set `NCCL_DEBUG=INFO` when you run Python to see errors. You may need `NCCL_SOCKET_IFNAME=eth0` (replace with your NIC name).
+
+Docker: run **the same image** on master and worker, mount the repo and data, activate the env, then run the two commands as usual.
 
 ---
 
@@ -79,3 +91,4 @@ Overrides: `python model_transfer.py --help`.
 
 - **Nothing copies on the master:** On spark1, `MODEL_TRANSFER_DEST` equals `MODEL_TRANSFER_SRC` → use a different `DEST` on the master (see `env.master.example`).
 - **Error or hang on startup:** Both processes must run; `MASTER_ADDR` is spark1’s IP on both; same port.
+- **NCCL / distributed errors:** Try `MODEL_TRANSFER_TORCH_BACKEND=gloo` first. For `nccl`, ensure both nodes have GPU, matching containers, and check `NCCL_DEBUG=INFO`.

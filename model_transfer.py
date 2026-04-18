@@ -21,7 +21,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import pickle
@@ -74,6 +74,18 @@ def _mt_env_int(key: str, default: int) -> int:
     return int(v)
 
 
+def _resolve_dist_backend() -> str:
+    """gloo = CPU tensors (works without NCCL). nccl = GPU tensors (needs CUDA + NCCL)."""
+    raw = (_mt_env('TORCH_BACKEND') or 'gloo').strip().lower()
+    if raw not in ('gloo', 'nccl'):
+        print(f'Warning: unknown MODEL_TRANSFER_TORCH_BACKEND={raw!r}, using gloo')
+        raw = 'gloo'
+    if raw == 'nccl' and not torch.cuda.is_available():
+        print('Warning: MODEL_TRANSFER_TORCH_BACKEND=nccl but CUDA is not available; using gloo.')
+        raw = 'gloo'
+    return raw
+
+
 @dataclass
 class FileInfo:
     """Metadata for a file to transfer."""
@@ -96,13 +108,15 @@ class FileInfo:
 
 
 class RDMATransfer:
-    """RDMA-based transfer using PyTorch distributed."""
+    """PyTorch distributed transfer (Gloo or NCCL)."""
     
     def __init__(self, rank: int, world_size: int, master_addr: str, master_port: int):
         self.rank = rank
         self.world_size = world_size
         self.master_addr = master_addr
         self.master_port = master_port
+        self.backend = _resolve_dist_backend()
+        self.device = torch.device('cuda' if self.backend == 'nccl' else 'cpu')
         
         # Initialize distributed environment
         os.environ['MASTER_ADDR'] = master_addr
@@ -110,41 +124,41 @@ class RDMATransfer:
         os.environ['WORLD_SIZE'] = str(world_size)
         os.environ['RANK'] = str(rank)
         
-        # Use NCCL backend for RDMA (if available), fallback to GLOO
-        backend = 'nccl' if torch.cuda.is_available() else 'gloo'
-        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+        timeout_sec = _mt_env_int('INIT_TIMEOUT_SEC', 1800)
+        print(
+            f'PyTorch distributed: backend={self.backend}, device={self.device} '
+            f'(set MODEL_TRANSFER_TORCH_BACKEND=gloo|nccl; gloo needs no NCCL)'
+        )
+        dist.init_process_group(
+            backend=self.backend,
+            rank=rank,
+            world_size=world_size,
+            timeout=timedelta(seconds=timeout_sec),
+        )
         
     def send_file(self, file_path: str, dest_path: str):
-        """Send file using RDMA."""
+        """Send file using collective broadcast."""
+        dev = self.device
         if self.rank == 0:  # Sender
-            # Read file
             with open(file_path, 'rb') as f:
                 data = f.read()
             
-            # Convert to tensor
-            tensor = torch.ByteTensor(list(data))
-            
-            # Send tensor size first
-            size_tensor = torch.tensor([len(data)], dtype=torch.long)
+            tensor = torch.tensor(list(data), dtype=torch.uint8, device=dev)
+            size_tensor = torch.tensor([len(data)], dtype=torch.long, device=dev)
             dist.broadcast(size_tensor, src=0)
-            
-            # Send actual data
             dist.broadcast(tensor, src=0)
             print(f"Sent {file_path} ({len(data) / 1e9:.2f} GB)")
         else:  # Receiver
-            # Receive tensor size
-            size_tensor = torch.tensor([0], dtype=torch.long)
+            size_tensor = torch.zeros(1, dtype=torch.long, device=dev)
             dist.broadcast(size_tensor, src=0)
-            size = size_tensor.item()
+            size = int(size_tensor.item())
             
-            # Receive data
-            tensor = torch.ByteTensor(size)
+            tensor = torch.empty(size, dtype=torch.uint8, device=dev)
             dist.broadcast(tensor, src=0)
             
-            # Write to disk
-            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+            os.makedirs(os.path.dirname(dest_path) or '.', exist_ok=True)
             with open(dest_path, 'wb') as f:
-                f.write(tensor.numpy())
+                f.write(tensor.detach().cpu().numpy().tobytes())
             print(f"Received {dest_path} ({size / 1e9:.2f} GB)")
     
     def send_directory(self, src_dir: str, dest_dir: str, files: List[FileInfo]):
@@ -403,7 +417,7 @@ def main():
             f'{_ENV_PREFIX}RANK, {_ENV_PREFIX}WORLD_SIZE, {_ENV_PREFIX}MASTER_ADDR, '
             f'{_ENV_PREFIX}MASTER_PORT, {_ENV_PREFIX}LOCAL_IP, {_ENV_PREFIX}PEER_IP, '
             f'{_ENV_PREFIX}ZMQ_PORT, {_ENV_PREFIX}NUM_STREAMS, {_ENV_PREFIX}DEST_HOST, '
-            f'{_ENV_PREFIX}DEST_USER'
+            f'{_ENV_PREFIX}DEST_USER, {_ENV_PREFIX}TORCH_BACKEND, {_ENV_PREFIX}INIT_TIMEOUT_SEC'
         ),
     )
     parser.add_argument('--src', default=_mt_env('SRC'), help='Source directory (spark1)')
